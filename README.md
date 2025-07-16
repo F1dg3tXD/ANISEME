@@ -41,6 +41,7 @@ Animate Visemes and Lip Sync with driving clips from audio.
 3. Import the viseme XML and audio clips into Blender.
 4. Use the audio clips to drive mouth shapes via Blender's audio-to-F-curve feature or custom drivers.
 
-## License
+## Why?
 
-See LICENSE file for details.
+I've been trying to find a solution like this for 5 years at this point.
+I didn't find one.
