@@ -1,3 +1,5 @@
+<img align="left" width="308" height="308" alt="iconW" src="https://github.com/user-attachments/assets/57e6dc0f-90dc-46bb-87db-26d226cf3cc2" />
+
 # ANISEME
 Animate Visemes and Lip Sync with driving clips from audio.
 
