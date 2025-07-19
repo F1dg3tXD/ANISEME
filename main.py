@@ -1,9 +1,11 @@
 import whisper
 import pronouncing
 import numpy as np
+import torch
+import sys
 import os
 from viseme_map import PHONEME_TO_VISEME
-from PyQt6 import QtWidgets, QtCore, QtGui  # <-- Add QtGui import
+from PyQt6 import QtWidgets, QtCore, QtGui
 import re
 import xml.etree.ElementTree as ET
 from pydub import AudioSegment
@@ -12,8 +14,8 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ANISEME")
-        self.setGeometry(100, 100, 600, 400)
-        self.setWindowIcon(QtGui.QIcon("res/iconw.png"))  # <-- Set window icon
+        self.setGeometry(100, 100, 600, 500)
+        self.setWindowIcon(QtGui.QIcon("res/iconw.png"))
 
         self.central_widget = QtWidgets.QWidget()
         self.setCentralWidget(self.central_widget)
@@ -22,6 +24,12 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.file_button = QtWidgets.QPushButton("Select WAV File")
         self.file_button.clicked.connect(self.select_audio)
         layout.addWidget(self.file_button)
+
+        self.transcript_label = QtWidgets.QLabel("Optional Transcript:")
+        layout.addWidget(self.transcript_label)
+        self.transcript_input = QtWidgets.QTextEdit()
+        self.transcript_input.setPlaceholderText("Paste transcript here to improve accuracy...")
+        layout.addWidget(self.transcript_input)
 
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
@@ -49,12 +57,17 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
             return
 
         self.log("Loading Whisper model...")
-        model = whisper.load_model("base")
-        self.log("Transcribing...")
+        model = whisper.load_model("large-v3", device="cuda" if torch.cuda.is_available() else "cpu")
 
-        result = model.transcribe(self.audio_path, word_timestamps=True, language='en')
+        transcript = self.transcript_input.toPlainText().strip()
+        if transcript:
+            self.log("Transcribing with provided transcript hint...")
+            result = model.transcribe(self.audio_path, word_timestamps=True, language='en', initial_prompt=transcript)
+        else:
+            self.log("Transcribing without transcript hint...")
+            result = model.transcribe(self.audio_path, word_timestamps=True, language='en')
+
         words = []
-
         for seg in result["segments"]:
             for w in seg.get("words", []):
                 words.append((w["word"], w["start"], w["end"]))
@@ -78,7 +91,6 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
                     active = False
                     ET.SubElement(viseme_elem, "spike", start=f"{start_frame / fps:.2f}", end=f"{end_frame / fps:.2f}")
 
-            # Handle trailing spike
             if active:
                 ET.SubElement(viseme_elem, "spike", start=f"{start_frame / fps:.2f}", end=f"{len(track) / fps:.2f}")
 
@@ -90,16 +102,48 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         viseme_tracks = {v: np.zeros(int(duration * 100), dtype=np.float32) for v in PHONEME_TO_VISEME.values()}
         viseme_tracks["sil"] = np.zeros(int(duration * 100), dtype=np.float32)
 
+        VOWELS = {"AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER", "EY", "IH", "IY", "OW", "OY", "UH", "UW"}
+
         for word, start, end in words:
             phonemes = self.get_phonemes(word)
             if not phonemes:
                 self.log(f"No phonemes found for '{word}', defaulting to 'sil'.")
                 phonemes = ['sil']
 
-            phoneme_duration = (end - start) / len(phonemes)
-            for i, phon in enumerate(phonemes):
-                t_start = int((start + i * phoneme_duration) * 100)
-                t_end = int((start + (i + 1) * phoneme_duration) * 100)
+            # Assign higher weight to vowels
+            weights = []
+            for phon in phonemes:
+                phon_root = re.sub(r"\d", "", phon.upper())
+                weights.append(2.0 if phon_root in VOWELS else 1.0)
+
+            total_weight = sum(weights)
+            if total_weight == 0:
+                continue
+
+            word_duration = end - start
+            current_time = start
+
+            # Assign a minimum duration per phoneme to avoid losing any
+            min_dur = 0.001  # 1ms minimum for very short phonemes
+            total_assigned = 0.0
+            durations = []
+
+            for weight in weights:
+                ideal_duration = word_duration * (weight / total_weight)
+                dur = max(min_dur, ideal_duration)
+                durations.append(dur)
+                total_assigned += dur
+
+            # Adjust durations if total goes over word duration
+            if total_assigned > word_duration:
+                scale = word_duration / total_assigned
+                durations = [d * scale for d in durations]
+
+            for phon, dur in zip(phonemes, durations):
+                t_start = int(current_time * 100)
+                t_end = int((current_time + dur) * 100)
+                current_time += dur
+
                 viseme = PHONEME_TO_VISEME.get(phon.upper(), "sil")
                 viseme_tracks[viseme][t_start:t_end] = 1.0
 
@@ -110,16 +154,14 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.save_viseme_xml(viseme_tracks)
         self.log("Saved viseme XML to output/viseme_tracks.xml")
 
-        # Audio splitting
         self.log("Splitting audio by viseme...")
         self.split_audio_by_viseme(viseme_tracks, duration)
         self.log("Saved individual viseme WAV files.")
 
     def split_audio_by_viseme(self, viseme_tracks, duration):
-    
         full_audio = AudioSegment.from_wav(self.audio_path)
         total_ms = int(duration * 1000)
-        fade_ms = 20  # 20ms soft fade
+        fade_ms = 20
 
         for viseme, track in viseme_tracks.items():
             output_audio = AudioSegment.silent(duration=total_ms)
@@ -141,7 +183,6 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
 
                     output_audio = output_audio.overlay(spike, position=ms_start)
 
-            # Trailing viseme region
             if active:
                 ms_start = int(t_start * 10)
                 ms_end = int(len(track) * 10)
@@ -155,15 +196,11 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
             output_audio.export(output_path, format="wav")
 
     def get_phonemes(self, word):
-        # Normalize the word
         word_clean = re.sub(r"[^a-zA-Z]", "", word).lower()
-
-        # Use pronouncing to find phonemes
         phones = pronouncing.phones_for_word(word_clean)
         if phones:
             return phones[0].split()
 
-        # Optional fallback: try to split contractions (like "that's" -> "that", "is")
         if "'" in word.lower():
             parts = word.lower().replace("'", " ").split()
             phonemes = []

@@ -1,4 +1,4 @@
-<img align="left" width="308" height="308" alt="iconW" src="https://github.com/user-attachments/assets/57e6dc0f-90dc-46bb-87db-26d226cf3cc2" />
+<img align="center" width="300" height="300" alt="iconW" src="https://raw.githubusercontent.com/F1dg3tXD/ANISEME/refs/heads/main/res/iconW.png" />
 
 # ANISEME
 Animate Visemes and Lip Sync with driving clips from audio.
@@ -40,6 +40,15 @@ Animate Visemes and Lip Sync with driving clips from audio.
 2. Use ANISEME to process the audio.
 3. Import the viseme XML and audio clips into Blender.
 4. Use the audio clips to drive mouth shapes via Blender's audio-to-F-curve feature or custom drivers.
+
+## GPU Setting
+If you have an RTX 5070ti, you don't have to do this step.
+
+To use your GPU correctly, make sure to uninstall torch if the program crashes on processing.
+
+```pip uninstall torch```
+
+You can then install the correct PyTorch version for your GPU.
 
 ## Why?
 
