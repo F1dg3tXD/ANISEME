@@ -13,6 +13,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from pydub import AudioSegment
 import torch
 import whisper
+import whisper.timing as whisper_timing
 
 from viseme_map import PHONEME_TO_VISEME
 
@@ -85,6 +86,22 @@ def detect_best_device():
         return "mps"
 
     return "cpu"
+
+
+def patch_whisper_mps_compat():
+    if getattr(whisper_timing, "_aniseme_mps_patch", False):
+        return False
+
+    original_dtw = whisper_timing.dtw
+
+    def safe_dtw(x):
+        if getattr(getattr(x, "device", None), "type", None) == "mps":
+            return whisper_timing.dtw_cpu(x.float().cpu().numpy())
+        return original_dtw(x)
+
+    whisper_timing.dtw = safe_dtw
+    whisper_timing._aniseme_mps_patch = True
+    return True
 
 
 def ensure_directory(path: Path, fallback: Path | None = None):
@@ -505,6 +522,7 @@ class WhisperJobWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         enable_system_trust_store()
+        patch_whisper_mps_compat()
         self.status_changed.emit(self.job_id, "Running")
         try:
             if self.mode == "download":
@@ -605,12 +623,14 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.setWindowIcon(QtGui.QIcon(str(BASE_DIR / "res" / "iconW.png")))
 
         self.ssl_patched = enable_system_trust_store()
+        self.mps_patch_applied = patch_whisper_mps_compat()
         self.device = detect_best_device()
         self.audio_path = ""
         self.job_counter = 0
         self.job_rows = {}
         self.job_threads = {}
         self.active_transcription_jobs = set()
+        self.current_job_id = None
 
         self.settings_path = settings_file_path()
         self.settings = load_settings(self.settings_path)
@@ -626,6 +646,8 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.log(f"Detected device: {self.device}")
         if self.ssl_patched:
             self.log("System trust store enabled for HTTPS downloads.")
+        if self.mps_patch_applied:
+            self.log("Applied Whisper MPS compatibility patch for word timestamp alignment.")
 
     def build_main_ui(self):
         self.central_widget = QtWidgets.QWidget()
@@ -686,6 +708,16 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.process_button.clicked.connect(self.run_whisper)
         button_row.addWidget(self.process_button)
         layout.addLayout(button_row)
+
+        self.current_job_label = QtWidgets.QLabel("No active jobs yet.")
+        self.current_job_label.setWordWrap(True)
+        layout.addWidget(self.current_job_label)
+
+        self.current_job_progress = QtWidgets.QProgressBar()
+        self.current_job_progress.setRange(0, 100)
+        self.current_job_progress.setValue(0)
+        self.current_job_progress.setFormat("%p%")
+        layout.addWidget(self.current_job_progress)
 
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
@@ -1019,10 +1051,16 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         progress_bar.setRange(0, 100)
         progress_bar.setValue(0)
         progress_bar.setFormat("%p%")
+        progress_bar.setMinimumWidth(180)
         self.jobs_table.setCellWidget(row, 4, progress_bar)
 
         self.jobs_table.setItem(row, 5, QtWidgets.QTableWidgetItem("Queued"))
-        self.job_rows[job_id] = {"row": row, "progress": progress_bar}
+        self.job_rows[job_id] = {
+            "row": row,
+            "progress": progress_bar,
+            "type": job_type,
+            "target": target,
+        }
         self.jobs_dock.raise_()
 
     def update_job_stage(self, job_id, stage):
@@ -1030,18 +1068,24 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         if not row_info:
             return
         self.jobs_table.item(row_info["row"], 3).setText(stage)
+        if job_id == self.current_job_id:
+            self.current_job_label.setText(f"{job_id} | {row_info['type']} | {stage}")
 
     def update_job_progress(self, job_id, value):
         row_info = self.job_rows.get(job_id)
         if not row_info:
             return
         row_info["progress"].setValue(value)
+        if job_id == self.current_job_id:
+            self.current_job_progress.setValue(value)
 
     def update_job_status(self, job_id, status):
         row_info = self.job_rows.get(job_id)
         if not row_info:
             return
         self.jobs_table.item(row_info["row"], 5).setText(status)
+        if job_id == self.current_job_id and status in {"Completed", "Failed"}:
+            self.current_job_label.setText(f"{job_id} | {row_info['type']} | {status}")
 
     def handle_job_log(self, job_id, message):
         self.log(f"[{job_id}] {message}")
@@ -1051,9 +1095,13 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.log(f"[{job_id}] {message}")
         if "output_dir" in result:
             self.log(f"[{job_id}] Output folder: {result['output_dir']}")
+        if job_id == self.current_job_id:
+            self.current_job_progress.setValue(100)
 
     def handle_job_failed(self, job_id, error_message):
         self.log(f"[{job_id}] Failed: {error_message}")
+        if job_id == self.current_job_id:
+            self.current_job_label.setText(f"{job_id} | Failed | {error_message}")
 
     def cleanup_job(self, job_id):
         thread_info = self.job_threads.pop(job_id, None)
@@ -1073,6 +1121,9 @@ class WhisperVisemeApp(QtWidgets.QMainWindow):
         self.add_job_row(job_id, job_type, target_text)
         if mode == "transcribe":
             self.active_transcription_jobs.add(job_id)
+        self.current_job_id = job_id
+        self.current_job_label.setText(f"{job_id} | {job_type} | Queued")
+        self.current_job_progress.setValue(0)
 
         thread = QtCore.QThread(self)
         worker = WhisperJobWorker(
